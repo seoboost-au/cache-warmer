@@ -25,7 +25,7 @@ jobs:
       - name: Run Cache Warmer
         run: npm run start
         env:
-          BRD_PROXY_ID: ${{ secrets.BRD_PROXY_ID }}
+          BRD_PROXY_ID: ${{ secrets.BRD_PROXY_AU }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
