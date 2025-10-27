@@ -12,16 +12,16 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 /* ====== KONFIG DOMAIN/PROXY/UA ====== */
 const DOMAINS_MAP = {
   // ganti key "id" sesuai grouping kamu (hanya label internal)
-  id: "https://seoboost.au",
+  au: "https://seoboost.au",
 };
 
 const PROXIES = {
   // contoh: http://user:pass@zproxy.lum-superproxy.io:22225
-  id: process.env.BRD_PROXY_AU,
+  au: process.env.BRD_PROXY_AU,
 };
 
 const USER_AGENTS = {
-  id: "Seoboost-CacheWarmer-AU/1.0",
+  au: "Seoboost-CacheWarmer-AU/1.0",
 };
 
 /* ====== CLOUDFLARE (opsional) ====== */
