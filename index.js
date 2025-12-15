@@ -14,6 +14,9 @@ const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const DOMAIN = "https://seoboost.au";
 
 const PROXY = process.env.BRD_PROXY_AU;
+if (!PROXY) {
+  throw new Error("❌ BRD_PROXY_AU is required");
+}
 
 const USER_AGENT = "Seoboost-CacheWarmer-AU/1.0";
 
@@ -27,6 +30,10 @@ function extractCfEdge(cfRay) {
   return "N/A";
 }
 
+function shouldPurgeByVercel(vercelCache) {
+  return ["MISS", "REVALIDATED", "PRERENDER", "STALE"].includes(vercelCache);
+}
+
 /* ================= LOGGER → GSHEETS ================= */
 class AppsScriptLogger {
   constructor() {
@@ -37,11 +44,11 @@ class AppsScriptLogger {
   }
 
   log({
-    country = "",
+    edge = "",
     url = "",
     status = "",
     cfCache = "",
-    originCache = "",
+    vercelCache = "",
     cfRay = "",
     responseMs = "",
     error = 0,
@@ -51,11 +58,11 @@ class AppsScriptLogger {
       this.runId,
       this.startedAt,
       this.finishedAt,
-      country,
+      edge,
       url,
       status,
       cfCache,
-      originCache,
+      vercelCache,
       cfRay,
       typeof responseMs === "number" ? responseMs : "",
       error ? 1 : 0,
@@ -83,33 +90,32 @@ class AppsScriptLogger {
       }
     );
 
+    console.log(`📝 Logged ${this.rows.length} rows to GSheets`);
     this.rows = [];
   }
 }
 
-/* ================= HTTP (AU ANCHORED) ================= */
-function createAuAgent() {
-  if (!PROXY) throw new Error("Missing BRD_PROXY_AU");
-  return new HttpsProxyAgent(PROXY);
-}
+/* ================= HTTP ================= */
+const agent = new HttpsProxyAgent(PROXY);
 
-async function fetchWithProxy(url, agent, timeout = 15000) {
-  const res = await axios.get(url, {
+function axiosCfg(timeout = 30000) {
+  return {
     httpsAgent: agent,
     timeout,
     headers: {
       "User-Agent": USER_AGENT,
-      Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-AU,en;q=0.9",
+      Accept: "text/html,application/xhtml+xml",
     },
-  });
-  return res.data;
+  };
 }
 
-/* ================= SITEMAP (URLSET ONLY) ================= */
-async function fetchUrlsFromSitemap(agent) {
+/* ================= SITEMAP (SINGLE) ================= */
+async function fetchUrlsFromSitemap() {
   try {
-    const xml = await fetchWithProxy(`${DOMAIN}/sitemap.xml`, agent, 20000);
+    const xml = await axios
+      .get(`${DOMAIN}/sitemap.xml`, axiosCfg(20000))
+      .then((r) => r.data);
+
     const parsed = await parseStringPromise(xml, {
       explicitArray: false,
       ignoreAttrs: true,
@@ -121,7 +127,8 @@ async function fetchUrlsFromSitemap(agent) {
     return (Array.isArray(urls) ? urls : [urls])
       .map((u) => u.loc)
       .filter(Boolean);
-  } catch {
+  } catch (e) {
+    console.warn("❌ Failed to fetch sitemap:", e?.message || e);
     return [];
   }
 }
@@ -140,79 +147,68 @@ async function purgeCloudflareCache(url) {
       },
     }
   );
+
+  console.log(`🧹 CF purged → ${url}`);
 }
 
 /* ================= WARMER ================= */
-async function warmUrls(urls, agent, logger) {
-  const BATCH_SIZE = 3;
-  const DELAY = 7000;
+async function warmUrls(urls, logger) {
+  for (const url of urls) {
+    const t0 = Date.now();
 
-  const batches = Array.from(
-    { length: Math.ceil(urls.length / BATCH_SIZE) },
-    (_, i) => urls.slice(i * BATCH_SIZE, i * BATCH_SIZE + BATCH_SIZE)
-  );
+    try {
+      const res = await axios.get(url, axiosCfg(30000));
+      const dt = Date.now() - t0;
 
-  for (const batch of batches) {
-    await Promise.all(
-      batch.map(async (url) => {
-        const t0 = Date.now();
-        try {
-          const res = await axios.get(url, {
-            httpsAgent: agent,
-            timeout: 30000,
-            headers: { "User-Agent": USER_AGENT },
-          });
+      const cfCache = res.headers["cf-cache-status"] || "N/A";
+      const vercelCache = res.headers["x-vercel-cache"] || "N/A";
+      const cfRay = res.headers["cf-ray"] || "";
+      const edge = extractCfEdge(cfRay);
 
-          const dt = Date.now() - t0;
+      console.log(
+        `[${edge}] ${res.status} cf=${cfCache} vercel=${vercelCache} - ${url}`
+      );
 
-          const cfCache = res.headers["cf-cache-status"] || "N/A";
-          const cfRay = res.headers["cf-ray"] || "N/A";
-          const edge = extractCfEdge(cfRay);
-          const originCache = res.headers["x-litespeed-cache"] || "N/A";
+      logger.log({
+        edge,
+        url,
+        status: res.status,
+        cfCache,
+        vercelCache,
+        cfRay,
+        responseMs: dt,
+      });
 
-          console.log(
-            `[${edge}] ${res.status} cf=${cfCache} ls=${originCache} - ${url}`
-          );
+      // ✅ PURGE RULE — SESUAI KEPUTUSAN KAMU
+      if (shouldPurgeByVercel(vercelCache)) {
+        await purgeCloudflareCache(url);
+      }
+    } catch (err) {
+      logger.log({
+        edge: "ERROR",
+        url,
+        error: 1,
+        message: err?.message || "request failed",
+      });
+    }
 
-          logger.log({
-            country: edge,
-            url,
-            status: res.status,
-            cfCache,
-            originCache,
-            cfRay,
-            responseMs: dt,
-          });
-
-          if (cfCache !== "HIT") {
-            await purgeCloudflareCache(url);
-          }
-        } catch (e) {
-          logger.log({
-            country: "ERROR",
-            url,
-            error: 1,
-            message: e?.message || "request failed",
-          });
-        }
-      })
-    );
-
-    await sleep(DELAY);
+    await sleep(1500);
   }
 }
 
 /* ================= MAIN ================= */
 (async () => {
+  console.log(`[CacheWarmer-AU] Started at ${new Date().toISOString()}`);
   const logger = new AppsScriptLogger();
-  const agent = createAuAgent();
 
   try {
-    const urls = await fetchUrlsFromSitemap(agent);
+    const urls = await fetchUrlsFromSitemap();
     console.log(`[AU] Found ${urls.length} URLs`);
-    await warmUrls(urls, agent, logger);
+    await warmUrls(urls, logger);
   } finally {
     logger.setFinished();
     await logger.flush();
   }
+
+  console.log(`[CacheWarmer-AU] Finished at ${new Date().toISOString()}`);
 })();
