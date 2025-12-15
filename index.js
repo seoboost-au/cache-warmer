@@ -1,4 +1,3 @@
-// cache-warmer-au.js
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { parseStringPromise } from "xml2js";
@@ -12,17 +11,11 @@ const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
 /* ================= DOMAIN / PROXY / UA ================= */
-const DOMAINS_MAP = {
-  au: "https://seoboost.au",
-};
+const DOMAIN = "https://seoboost.au";
 
-const PROXIES = {
-  au: process.env.BRD_PROXY_AU,
-};
+const PROXY = process.env.BRD_PROXY_AU;
 
-const USER_AGENTS = {
-  au: "Seoboost-AU-CacheWarmer/1.0",
-};
+const USER_AGENT = "Seoboost-CacheWarmer-AU/1.0";
 
 /* ================= UTIL ================= */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -48,21 +41,21 @@ class AppsScriptLogger {
     url = "",
     status = "",
     cfCache = "",
-    lsCache = "",
+    originCache = "",
     cfRay = "",
     responseMs = "",
     error = 0,
     message = "",
   }) {
     this.rows.push([
-      this.runId, // run_id
-      this.startedAt, // started_at
-      this.finishedAt, // finished_at
-      country, // REAL CF EDGE (SYD, MEL, BNE, etc)
+      this.runId,
+      this.startedAt,
+      this.finishedAt,
+      country,
       url,
       status,
       cfCache,
-      lsCache,
+      originCache,
       cfRay,
       typeof responseMs === "number" ? responseMs : "",
       error ? 1 : 0,
@@ -81,8 +74,6 @@ class AppsScriptLogger {
   async flush() {
     if (!APPS_SCRIPT_URL || this.rows.length === 0) return;
 
-    console.log(`📝 Logging ${this.rows.length} rows to GSheets…`);
-
     await axios.post(
       APPS_SCRIPT_URL,
       { rows: this.rows },
@@ -92,24 +83,22 @@ class AppsScriptLogger {
       }
     );
 
-    console.log("✅ GSheets log sent");
     this.rows = [];
   }
 }
 
-/* ================= HTTP (AU-ANCHORED) ================= */
-function createAuAgent(country) {
-  const proxy = PROXIES[country];
-  if (!proxy) throw new Error(`Missing proxy for ${country}`);
-  return new HttpsProxyAgent(proxy);
+/* ================= HTTP (AU ANCHORED) ================= */
+function createAuAgent() {
+  if (!PROXY) throw new Error("Missing BRD_PROXY_AU");
+  return new HttpsProxyAgent(PROXY);
 }
 
-async function fetchWithProxy(url, agent, country, timeout = 15000) {
+async function fetchWithProxy(url, agent, timeout = 15000) {
   const res = await axios.get(url, {
     httpsAgent: agent,
     timeout,
     headers: {
-      "User-Agent": USER_AGENTS[country],
+      "User-Agent": USER_AGENT,
       Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-AU,en;q=0.9",
     },
@@ -117,26 +106,10 @@ async function fetchWithProxy(url, agent, country, timeout = 15000) {
   return res.data;
 }
 
-/* ================= SITEMAP ================= */
-async function fetchIndexSitemaps(domain, agent, country) {
+/* ================= SITEMAP (URLSET ONLY) ================= */
+async function fetchUrlsFromSitemap(agent) {
   try {
-    const xml = await fetchWithProxy(`${domain}/sitemap.xml`, agent, country);
-    const parsed = await parseStringPromise(xml, {
-      explicitArray: false,
-      ignoreAttrs: true,
-    });
-
-    const items = parsed?.sitemapindex?.sitemap;
-    if (!items) return [];
-    return (Array.isArray(items) ? items : [items]).map((i) => i.loc);
-  } catch {
-    return [];
-  }
-}
-
-async function fetchUrlsFromSitemap(sitemapUrl, agent, country) {
-  try {
-    const xml = await fetchWithProxy(sitemapUrl, agent, country);
+    const xml = await fetchWithProxy(`${DOMAIN}/sitemap.xml`, agent, 20000);
     const parsed = await parseStringPromise(xml, {
       explicitArray: false,
       ignoreAttrs: true,
@@ -144,7 +117,10 @@ async function fetchUrlsFromSitemap(sitemapUrl, agent, country) {
 
     const urls = parsed?.urlset?.url;
     if (!urls) return [];
-    return (Array.isArray(urls) ? urls : [urls]).map((u) => u.loc);
+
+    return (Array.isArray(urls) ? urls : [urls])
+      .map((u) => u.loc)
+      .filter(Boolean);
   } catch {
     return [];
   }
@@ -166,8 +142,8 @@ async function purgeCloudflareCache(url) {
   );
 }
 
-/* ================= WARMER (EDGE = CF REAL EDGE) ================= */
-async function warmUrls(urls, agent, country, logger) {
+/* ================= WARMER ================= */
+async function warmUrls(urls, agent, logger) {
   const BATCH_SIZE = 3;
   const DELAY = 7000;
 
@@ -184,21 +160,18 @@ async function warmUrls(urls, agent, country, logger) {
           const res = await axios.get(url, {
             httpsAgent: agent,
             timeout: 30000,
-            headers: { "User-Agent": USER_AGENTS[country] },
+            headers: { "User-Agent": USER_AGENT },
           });
 
           const dt = Date.now() - t0;
 
-          /* ===== EDGE (Cloudflare) ===== */
           const cfCache = res.headers["cf-cache-status"] || "N/A";
           const cfRay = res.headers["cf-ray"] || "N/A";
           const edge = extractCfEdge(cfRay);
-
-          /* ===== ORIGIN (LiteSpeed) ===== */
-          const lsCache = res.headers["x-litespeed-cache"] || "N/A";
+          const originCache = res.headers["x-litespeed-cache"] || "N/A";
 
           console.log(
-            `[${edge}] ${res.status} cf=${cfCache} ls=${lsCache} - ${url}`
+            `[${edge}] ${res.status} cf=${cfCache} ls=${originCache} - ${url}`
           );
 
           logger.log({
@@ -206,24 +179,17 @@ async function warmUrls(urls, agent, country, logger) {
             url,
             status: res.status,
             cfCache,
-            lsCache,
+            originCache,
             cfRay,
             responseMs: dt,
-            error: 0,
           });
 
-          /* ===== EDGE DECISION ===== */
           if (cfCache !== "HIT") {
             await purgeCloudflareCache(url);
           }
-
-          /* ===== ORIGIN DECISION (SOFT) ===== */
-          if (String(lsCache).toLowerCase() !== "hit") {
-            await sleep(3000);
-          }
         } catch (e) {
           logger.log({
-            country,
+            country: "ERROR",
             url,
             error: 1,
             message: e?.message || "request failed",
@@ -239,21 +205,12 @@ async function warmUrls(urls, agent, country, logger) {
 /* ================= MAIN ================= */
 (async () => {
   const logger = new AppsScriptLogger();
+  const agent = createAuAgent();
 
   try {
-    for (const [country, domain] of Object.entries(DOMAINS_MAP)) {
-      const agent = createAuAgent(country);
-
-      const sitemaps = await fetchIndexSitemaps(domain, agent, country);
-      const urls = (
-        await Promise.all(
-          sitemaps.map((s) => fetchUrlsFromSitemap(s, agent, country))
-        )
-      ).flat();
-
-      console.log(`[${country}] Found ${urls.length} URLs`);
-      await warmUrls(urls, agent, country, logger);
-    }
+    const urls = await fetchUrlsFromSitemap(agent);
+    console.log(`[AU] Found ${urls.length} URLs`);
+    await warmUrls(urls, agent, logger);
   } finally {
     logger.setFinished();
     await logger.flush();
