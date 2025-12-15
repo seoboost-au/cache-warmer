@@ -1,4 +1,4 @@
-// cache-warmer.js
+// cache-warmer-au.js
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { parseStringPromise } from "xml2js";
@@ -6,365 +6,211 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
-/* ====== ENV WAJIB ====== */
+/* ================= ENV ================= */
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-
-/* ====== KONFIG DOMAIN/PROXY/UA ====== */
-const DOMAINS_MAP = {
-  // ganti key sesuai kebutuhan
-  au: "https://seoboost.au",
-};
-
-const PROXIES = {
-  au: process.env.BRD_PROXY_AU,
-};
-
-const USER_AGENTS = {
-  au: "Seoboost-CacheWarmer-AU/1.0",
-};
-
-/* ====== CLOUDFLARE (opsional) ====== */
 const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
-/* ====== APPS SHEET HEADERS (tambah vercel_edge) ======
-   Pastikan Apps Script DEFAULT_HEADER sama urutannya.
-*/
-const APPS_SHEET_HEADERS = [
-  "run_id",
-  "started_at",
-  "finished_at",
-  "country",
-  "url",
-  "status",
-  "cf_cache",
-  "vercel_cache",
-  "cf_ray",
-  "vercel_edge", // <-- new column
-  "response_ms",
-  "error",
-  "message",
-];
+/* ================= TARGET (AU) ================= */
+const DOMAIN = "https://seoboost.au";
+const PROXY = process.env.BRD_PROXY_AU;
+const USER_AGENT = "Seoboost-CacheWarmer-AU/1.0";
 
-/* ====== UTIL ====== */
+/* ================= HARD GUARD ================= */
+if (!PROXY) {
+  throw new Error("❌ BRD_PROXY_AU is REQUIRED. Aborting to avoid US edge.");
+}
+
+/* ================= UTIL ================= */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const cryptoRandomId = () =>
-  Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+function extractCfEdge(cfRay) {
+  if (typeof cfRay === "string" && cfRay.includes("-")) {
+    return cfRay.split("-").pop();
+  }
+  return "UNKNOWN";
+}
 
 function makeSheetNameForRun(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
-  const local = new Date(date.getTime() + 8 * 3600 * 1000); // WITA +08
-  return `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(
-    local.getUTCDate()
-  )}_${pad(local.getUTCHours())}-${pad(local.getUTCMinutes())}-${pad(
-    local.getUTCSeconds()
-  )}_WITA`;
+  const local = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  return (
+    `${local.getUTCFullYear()}-` +
+    `${pad(local.getUTCMonth() + 1)}-` +
+    `${pad(local.getUTCDate())}_` +
+    `${pad(local.getUTCHours())}-` +
+    `${pad(local.getUTCMinutes())}-` +
+    `${pad(local.getUTCSeconds())}_WITA`
+  );
 }
 
-/* ====== LOGGER → APPS SCRIPT (BATCH PER-RUN) ====== */
+/* ================= LOGGER ================= */
 class AppsScriptLogger {
   constructor() {
     this.rows = [];
-    this.runId = cryptoRandomId();
+    this.runId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     this.startedAt = new Date().toISOString();
     this.finishedAt = null;
-    this.sheetName = makeSheetNameForRun(); // satu tab per-run
+    this.sheetName = makeSheetNameForRun();
   }
 
   log({
-    country = "",
+    edge = "",
     url = "",
     status = "",
     cfCache = "",
-    vcCache = "",
+    vercelCache = "",
     cfRay = "",
-    vercelEdge = "",
     responseMs = "",
     error = 0,
     message = "",
   }) {
     this.rows.push([
-      this.runId, // run_id
-      this.startedAt, // started_at (ISO)
-      this.finishedAt, // finished_at (isi saat finalize)
-      country, // country or CF PoP code
-      url, // url
-      status, // status code
-      cfCache, // cf_cache (Cloudflare)
-      vcCache, // vercel_cache (x-vercel-cache)
-      cfRay, // cf_ray
-      vercelEdge, // vercel_edge (NEW column)
-      typeof responseMs === "number" ? responseMs : "", // response_ms
-      error ? 1 : 0, // error (0/1)
-      message, // message
+      this.runId,
+      this.startedAt,
+      this.finishedAt,
+      edge,
+      url,
+      status,
+      cfCache,
+      vercelCache,
+      cfRay,
+      typeof responseMs === "number" ? responseMs : "",
+      error ? 1 : 0,
+      message,
     ]);
   }
 
   setFinished() {
     this.finishedAt = new Date().toISOString();
-    this.rows = this.rows.map((r) => ((r[2] = this.finishedAt), r));
+    this.rows = this.rows.map((r) => {
+      r[2] = this.finishedAt;
+      return r;
+    });
   }
 
   async flush() {
-    if (!APPS_SCRIPT_URL) {
-      console.warn("Apps Script logging disabled (missing APPS_SCRIPT_URL).");
-      return;
-    }
-    if (this.rows.length === 0) return;
+    if (!APPS_SCRIPT_URL || this.rows.length === 0) return;
 
-    try {
-      const payload = {
-        sheetName: this.sheetName,
-        headers: APPS_SHEET_HEADERS,
-        rows: this.rows,
-      };
-
-      const res = await axios.post(APPS_SCRIPT_URL, payload, {
-        timeout: 20000,
-        headers: { "Content-Type": "application/json" },
-      });
-      console.log("Apps Script response:", res.status, res.data);
-      if (!res.data?.ok) console.warn("Apps Script replied error:", res.data);
-      this.rows = []; // bersihkan buffer
-    } catch (e) {
-      console.warn(
-        "Apps Script logging error:",
-        e?.response?.status,
-        e?.response?.data || e?.message || e
-      );
-    }
-  }
-}
-
-/* ====== HTTP helper (proxy) ====== */
-function buildAxiosCfg(country, extra = {}) {
-  const proxy = PROXIES[country];
-  const headers = { "User-Agent": USER_AGENTS[country] || "CacheWarmer/1.0" };
-
-  // siapkan agent + paksa Proxy-Authorization kalau ada user:pass
-  let httpAgent, httpsAgent;
-  if (proxy) {
-    try {
-      const u = new URL(proxy);
-      if (u.username && u.password) {
-        const basic = Buffer.from(
-          `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`
-        ).toString("base64");
-        headers["Proxy-Authorization"] = `Basic ${basic}`;
-      }
-      const agent = new HttpsProxyAgent(proxy, { keepAlive: true });
-      httpAgent = agent;
-      httpsAgent = agent;
-    } catch (e) {
-      console.warn(
-        `[${country}] Invalid proxy URL: ${proxy} (${e?.message || e})`
-      );
-    }
-  }
-
-  return {
-    headers,
-    timeout: 30000,
-    httpAgent,
-    httpsAgent,
-    ...extra,
-  };
-}
-
-/* ====== SITEMAP (single /sitemap.xml) ====== */
-async function fetchWithProxy(url, country, timeout = 15000) {
-  const cfg = buildAxiosCfg(country, { timeout });
-  const res = await axios.get(url, cfg);
-  return res.data;
-}
-
-async function fetchUrlsFromSingleSitemap(domain, country) {
-  try {
-    const xml = await fetchWithProxy(`${domain}/sitemap.xml`, country, 20000);
-    const result = await parseStringPromise(xml, {
-      explicitArray: false,
-      ignoreAttrs: true,
-    });
-
-    const urlList = result?.urlset?.url;
-    if (!urlList) return [];
-
-    const urls = Array.isArray(urlList) ? urlList : [urlList];
-    const locs = urls.map((entry) => entry.loc).filter(Boolean);
-
-    // dedup + pastikan host sama (jaga-jaga)
-    const sameHost = new URL(domain).host.replace(/^www\./i, "");
-    const unique = Array.from(
-      new Set(
-        locs.filter((u) => {
-          try {
-            const h = new URL(u).host.replace(/^www\./i, "");
-            return h === sameHost;
-          } catch {
-            return false;
-          }
-        })
-      )
+    await axios.post(
+      APPS_SCRIPT_URL,
+      { sheetName: this.sheetName, rows: this.rows },
+      { timeout: 20000, headers: { "Content-Type": "application/json" } }
     );
 
-    return unique;
-  } catch (err) {
-    console.warn(
-      `[${country}] ❌ Failed to fetch URLs from ${domain}/sitemap.xml: ${
-        err?.message || err
-      }`
-    );
-    return [];
+    console.log(`📝 Logged ${this.rows.length} rows → ${this.sheetName}`);
+    this.rows = [];
   }
 }
 
-/* === helper: ambil POP vercel dari x-vercel-id (contoh: "syd1::iad1::...") === */
-function getVercelEdgePop(vercelIdHeader) {
-  if (typeof vercelIdHeader !== "string") return "N/A";
-  const parts = vercelIdHeader.split("::").filter(Boolean);
-  return parts[0] || "N/A";
+/* ================= HTTP (AU-ANCHORED) ================= */
+const agent = new HttpsProxyAgent(PROXY);
+
+async function fetch(url, timeout = 30000) {
+  return axios.get(url, {
+    httpsAgent: agent,
+    timeout,
+    headers: {
+      "User-Agent": USER_AGENT,
+      "Accept-Language": "en-AU,en;q=0.9",
+    },
+  });
 }
 
-/* ====== WARMING (use cf-ray for country; also capture vercel_edge) ====== */
-async function retryableGet(url, cfg, retries = 3) {
-  let lastError = null;
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await axios.get(url, cfg);
-    } catch (err) {
-      lastError = err;
-      const code = err?.code || "";
-      const retryable =
-        axios.isAxiosError(err) &&
-        ["ECONNABORTED", "ECONNRESET", "ETIMEDOUT"].includes(code);
-      if (!retryable) break;
-      await sleep(2000);
-    }
-  }
-  throw lastError;
+/* ================= SITEMAP ================= */
+async function fetchUrlsFromSitemap() {
+  const xml = (await fetch(`${DOMAIN}/sitemap.xml`, 20000)).data;
+
+  const parsed = await parseStringPromise(xml, {
+    explicitArray: false,
+    ignoreAttrs: true,
+  });
+
+  const urls = parsed?.urlset?.url;
+  if (!urls) return [];
+
+  return (Array.isArray(urls) ? urls : [urls])
+    .map((u) => u.loc)
+    .filter(Boolean);
 }
 
+/* ================= CLOUDFLARE ================= */
 async function purgeCloudflareCache(url) {
   if (!CLOUDFLARE_ZONE_ID || !CLOUDFLARE_API_TOKEN) return;
-  try {
-    const purgeRes = await axios.post(
-      `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
-      { files: [url] },
-      {
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-    if (purgeRes.data?.success) {
-      console.log(`✅ Cloudflare cache purged: ${url}`);
-    } else {
-      console.warn(`⚠️ Failed to purge Cloudflare: ${url}`);
+
+  await axios.post(
+    `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
+    { files: [url] },
+    {
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
     }
-  } catch {
-    console.warn(`❌ Error purging Cloudflare: ${url}`);
-  }
-}
-
-async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
-  const batches = Array.from(
-    { length: Math.ceil(urls.length / batchSize) },
-    (_, i) => urls.slice(i * batchSize, i * batchSize + batchSize)
   );
+}
 
-  for (const batch of batches) {
-    await Promise.all(
-      batch.map(async (url) => {
-        const t0 = Date.now();
-        try {
-          const res = await retryableGet(
-            url,
-            buildAxiosCfg(country, { timeout: 15000 }),
-            3
-          );
-          const dt = Date.now() - t0;
+/* ================= WARMER ================= */
+async function warmUrls(urls, logger) {
+  for (const url of urls) {
+    const t0 = Date.now();
+    try {
+      const res = await fetch(url);
+      const dt = Date.now() - t0;
 
-          const cfCache = res.headers["cf-cache-status"] || "N/A";
-          const vcCache = res.headers["x-vercel-cache"] || "N/A";
-          const cfRay = res.headers["cf-ray"] || "N/A";
-          const vercelId = res.headers["x-vercel-id"] || "N/A";
-          const vercelEdge = getVercelEdgePop(vercelId); // parsed vercel POP (e.g. "syd1")
+      const cfCache = res.headers["cf-cache-status"] || "N/A";
+      const vercelCache = res.headers["x-vercel-cache"] || "N/A";
+      const cfRay = res.headers["cf-ray"] || "";
+      const edge = extractCfEdge(cfRay);
 
-          // Extract CF edge PoP (suffix after last dash in cf-ray, e.g. "...-LHR")
-          let cfEdge = "N/A";
-          if (typeof cfRay === "string" && cfRay.includes("-")) {
-            const parts = cfRay.split("-");
-            cfEdge = parts[parts.length - 1] || "N/A";
-          }
+      // HARD AU GUARD
+      if (!["SYD", "MEL", "BNE", "PER"].includes(edge)) {
+        throw new Error(`Non-AU edge detected: ${edge}`);
+      }
 
-          // countryTag prefers CF edge if present, else fallback ke label
-          const countryTag = cfEdge && cfEdge !== "N/A" ? cfEdge : country;
+      console.log(
+        `[${edge}] ${res.status} cf=${cfCache} vercel=${vercelCache} - ${url}`
+      );
 
-          console.log(
-            `[${countryTag}] ${res.status} cf=${cfCache} vercel=${vcCache} cf_edge=${cfEdge} vercel_edge=${vercelEdge} - ${url}`
-          );
+      logger.log({
+        edge,
+        url,
+        status: res.status,
+        cfCache,
+        vercelCache,
+        cfRay,
+        responseMs: dt,
+      });
 
-          logger.log({
-            country: countryTag,
-            url,
-            status: res.status,
-            cfCache,
-            vcCache,
-            cfRay,
-            vercelEdge, // include parsed vercel edge
-            responseMs: dt,
-            error: 0,
-            message: "",
-          });
+      if (["MISS", "REVALIDATED", "PRERENDER", "STALE"].includes(vercelCache)) {
+        await purgeCloudflareCache(url);
+      }
+    } catch (err) {
+      logger.log({
+        edge: "ERROR",
+        url,
+        error: 1,
+        message: err?.message || "request failed",
+      });
+    }
 
-          if (String(vcCache).toUpperCase() !== "HIT") {
-            await purgeCloudflareCache(url);
-          }
-        } catch (err) {
-          const dt = Date.now() - t0;
-          console.warn(
-            `[${country}] ❌ Failed to warm ${url}: ${err?.message || err}`
-          );
-
-          logger.log({
-            country, // saat gagal, tidak ada header → pakai label lama
-            url,
-            responseMs: dt,
-            error: 1,
-            message: err?.message || "request failed",
-          });
-        }
-      })
-    );
-
-    await sleep(delay);
+    await sleep(1500);
   }
 }
 
-/* ====== MAIN ====== */
+/* ================= MAIN ================= */
 (async () => {
-  console.log(`[CacheWarmer] Started: ${new Date().toISOString()}`);
+  console.log(`[CacheWarmer] Started ${new Date().toISOString()}`);
   const logger = new AppsScriptLogger();
 
   try {
-    await Promise.all(
-      Object.entries(DOMAINS_MAP).map(async ([country, domain]) => {
-        const urls = await fetchUrlsFromSingleSitemap(domain, country);
-
-        console.log(`[${country}] Found ${urls.length} URLs`);
-        logger.log({
-          country,
-          message: `Found ${urls.length} URLs for ${country}`,
-        });
-
-        await warmUrls(urls, country, logger);
-      })
-    );
+    const urls = await fetchUrlsFromSitemap();
+    console.log(`[AU] Found ${urls.length} URLs`);
+    await warmUrls(urls, logger);
   } finally {
     logger.setFinished();
     await logger.flush();
   }
 
-  console.log(`[CacheWarmer] Finished: ${new Date().toISOString()}`);
+  console.log(`[CacheWarmer] Finished ${new Date().toISOString()}`);
 })();
